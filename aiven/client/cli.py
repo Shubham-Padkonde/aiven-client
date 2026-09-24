@@ -3583,10 +3583,20 @@ ssl.truststore.type=JKS
             self.log.warning("Fetching application status failed: %s", ex)
         return None
 
-    def _wait_for_application(self, *, project: str, service_name: str, timeout: float) -> tuple[int, dict[str, Any] | None]:
-        """Poll the service until its deployment outcome is final, backing off to limit API load"""
+    def _wait_for_application(
+        self, *, project: str, service_name: str, timeout: float, require_new_deployment: bool
+    ) -> tuple[int, dict[str, Any] | None]:
+        """Poll the service until its deployment outcome is final, backing off to limit API load.
+
+        With require_new_deployment, a final outcome only counts once a new deployment is
+        evident: after a redeploy request the API keeps reporting the previous deployment's
+        status until the new build starts, so the first read is kept as a baseline and a final
+        outcome is accepted after an in-progress read or a build/deployment status that differs.
+        """
         deadline = self._monotonic() + timeout
         interval = APPLICATION_WAIT_FIRST_INTERVAL
+        new_deployment_seen = not require_new_deployment
+        baseline: tuple[Any, Any] | None = None
         consecutive_errors = 0
         summary: dict[str, Any] | None = None
         reported: dict[str, Any] | None = None
@@ -3609,12 +3619,20 @@ ssl.truststore.type=JKS
                         summary["outcome"],
                     )
                     reported = summary
-                if summary["outcome"] != "in_progress":
+                deployment = (summary["build_status"], summary["deployment_status"])
+                if baseline is None:
+                    baseline = deployment
+                if summary["outcome"] == "in_progress" or deployment != baseline:
+                    new_deployment_seen = True
+                if summary["outcome"] != "in_progress" and new_deployment_seen:
                     return (0 if summary["outcome"] == "succeeded" else 1), summary
 
             remaining = deadline - self._monotonic()
             if remaining <= 0:
-                self.log.error("Timeout waiting for application %r deployment", service_name)
+                if new_deployment_seen:
+                    self.log.error("Timeout waiting for application %r deployment", service_name)
+                else:
+                    self.log.error("Timeout: no new deployment of application %r was observed", service_name)
                 return EXIT_CODE_TIMEOUT, summary
             self._sleep(min(interval, remaining))
             interval = min(interval * APPLICATION_WAIT_BACKOFF, APPLICATION_WAIT_MAX_INTERVAL)
@@ -3649,6 +3667,45 @@ ssl.truststore.type=JKS
             project=self.get_project(),
             service_name=self.args.service_name,
             timeout=self.args.timeout,
+            require_new_deployment=False,
+        )
+        self._print_application_status(summary)
+        return exit_code
+
+    @arg.project
+    @arg.service_name
+    @arg(
+        "--wait",
+        action="store_true",
+        default=False,
+        help="Wait for the new deployment: exit 0 succeeded, 1 failed, 3 timeout or no new deployment seen",
+    )
+    @arg(
+        "--timeout",
+        type=int,
+        default=APPLICATION_WAIT_DEFAULT_TIMEOUT,
+        help="With --wait, wait for up to N seconds (default: %(default)s)",
+    )
+    @arg.json
+    def service__application__redeploy(self) -> int | None:
+        """Rebuild and redeploy an Aiven Runtime application from the latest commit of its branch"""
+        project = self.get_project()
+        # The status cannot tell an earlier deployment from the requested one, so --wait could
+        # report the earlier one's result.
+        if self._get_application_status(project, self.args.service_name)["outcome"] == "in_progress":
+            raise argx.UserError(
+                "A deployment of {name!r} is in progress; wait for it with "
+                "'avn service application wait {name}' and redeploy afterwards".format(name=self.args.service_name)
+            )
+        self.client.redeploy_application(project=project, service=self.args.service_name)
+        self.log.info("Redeploy of application %r requested", self.args.service_name)
+        if not self.args.wait:
+            return None
+        exit_code, summary = self._wait_for_application(
+            project=project,
+            service_name=self.args.service_name,
+            timeout=self.args.timeout,
+            require_new_deployment=True,
         )
         self._print_application_status(summary)
         return exit_code

@@ -1955,6 +1955,12 @@ class AivenClient(AivenClientBase):
             body=body,
         )
 
+    def redeploy_application(self, project: str, service: str) -> Mapping:
+        return self.verify(
+            self.post,
+            self.build_path("project", project, "service", service, "application", "redeploy"),
+        )
+
     def get_events(self, project: str, limit: int = 100) -> Sequence[dict[str, Any]]:
         params = {"limit": limit}
         return self.verify(

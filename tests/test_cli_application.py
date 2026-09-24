@@ -458,3 +458,108 @@ def test_application_wait_stops_on_client_error(tmp_path: Path) -> None:
     assert harness.run("service", "application", "wait", "--project", PROJECT, APP) == 1
     assert harness.session.paths("GET") == [SERVICE_PATH]
     assert harness.clock.sleeps == []
+
+
+def test_application_redeploy_without_wait(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    harness = make_harness(
+        tmp_path,
+        {
+            ("POST", SERVICE_PATH + "/application/redeploy"): [MockResponse(HTTPStatus.NO_CONTENT)],
+            ("GET", SERVICE_PATH): [service_response(*SUCCEEDED)],
+        },
+    )
+
+    assert harness.run("service", "application", "redeploy", "--project", PROJECT, APP) is None
+
+    assert [(r.method, r.path, r.body) for r in harness.session.requests] == [
+        ("GET", SERVICE_PATH, None),
+        ("POST", SERVICE_PATH + "/application/redeploy", None),
+    ]
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--wait"]])
+def test_application_redeploy_refuses_while_deployment_in_progress(
+    tmp_path: Path, caplog: LogCaptureFixture, extra_args: list[str]
+) -> None:
+    harness = make_harness(
+        tmp_path,
+        {
+            ("POST", SERVICE_PATH + "/application/redeploy"): [MockResponse(HTTPStatus.NO_CONTENT)],
+            ("GET", SERVICE_PATH): [service_response(*BUILDING)],
+        },
+    )
+
+    assert harness.run("service", "application", "redeploy", "--project", PROJECT, *extra_args, APP) == 1
+    assert f"'avn service application wait {APP}'" in caplog.text
+    assert harness.session.paths("POST") == []
+
+
+def test_application_redeploy_wait_ignores_stale_completed_status(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        {
+            ("POST", SERVICE_PATH + "/application/redeploy"): [MockResponse(HTTPStatus.NO_CONTENT)],
+            ("GET", SERVICE_PATH): [
+                service_response(*SUCCEEDED, commit_sha=SHA),
+                service_response(*SUCCEEDED, commit_sha=SHA),
+                service_response(*BUILDING),
+                service_response("RUNNING", "SUCCESS", "FAILED"),
+            ],
+        },
+    )
+
+    assert harness.run("service", "application", "redeploy", "--project", PROJECT, "--wait", APP) == 1
+    assert harness.session.paths("GET") == [SERVICE_PATH] * 4
+
+
+def test_application_redeploy_wait_succeeds(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    harness = make_harness(
+        tmp_path,
+        {
+            ("POST", SERVICE_PATH + "/application/redeploy"): [MockResponse(HTTPStatus.NO_CONTENT)],
+            ("GET", SERVICE_PATH): [
+                service_response(*SUCCEEDED),
+                service_response(*SUCCEEDED),
+                service_response(*BUILDING),
+                service_response(*SUCCEEDED, commit_sha=SHA),
+            ],
+        },
+    )
+
+    assert harness.run("service", "application", "redeploy", "--project", PROJECT, "--wait", "--json", APP) == 0
+    assert json.loads(capsys.readouterr().out)["deployed_commit_sha"] == SHA
+
+
+def test_application_redeploy_wait_detects_failure_between_polls(tmp_path: Path) -> None:
+    # The build started and failed between two polls, so no in-progress read was ever seen.
+    harness = make_harness(
+        tmp_path,
+        {
+            ("POST", SERVICE_PATH + "/application/redeploy"): [MockResponse(HTTPStatus.NO_CONTENT)],
+            ("GET", SERVICE_PATH): [
+                service_response(*SUCCEEDED),
+                service_response(*SUCCEEDED),
+                service_response("RUNNING", "FAILURE", "ABORTED"),
+            ],
+        },
+    )
+
+    assert harness.run("service", "application", "redeploy", "--project", PROJECT, "--wait", APP) == 1
+    assert harness.session.paths("GET") == [SERVICE_PATH] * 3
+
+
+def test_application_redeploy_wait_times_out_without_new_deployment(tmp_path: Path, caplog: LogCaptureFixture) -> None:
+    harness = make_harness(
+        tmp_path,
+        {
+            ("POST", SERVICE_PATH + "/application/redeploy"): [MockResponse(HTTPStatus.NO_CONTENT)],
+            ("GET", SERVICE_PATH): [service_response(*SUCCEEDED)],
+        },
+    )
+
+    assert (
+        harness.run("service", "application", "redeploy", "--project", PROJECT, "--wait", "--timeout", "60", APP)
+        == EXIT_CODE_TIMEOUT
+    )
+    assert "no new deployment" in caplog.text

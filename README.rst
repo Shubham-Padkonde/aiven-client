@@ -416,6 +416,11 @@ Show the build and deployment status::
 
     $ avn service application status myapp
 
+Rebuild from the latest commit of the configured branch and wait for the result
+(exit code 0 succeeded, 1 failed, 3 timeout)::
+
+    $ avn service application redeploy myapp --wait
+
 View build logs::
 
     $ avn service logs myapp --log-type application-build
