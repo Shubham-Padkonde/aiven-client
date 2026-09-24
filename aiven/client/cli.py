@@ -3710,6 +3710,103 @@ ssl.truststore.type=JKS
         self._print_application_status(summary)
         return exit_code
 
+    @arg.organization_id
+    @arg.json
+    def service__application__vcs_integration__list(self) -> None:
+        """List the VCS (GitHub) accounts connected to an organization for Aiven Runtime"""
+        integrations = self.client.list_application_vcs_integrations(organization_id=self.args.organization_id)
+        layout = ["vcs_integration_id", "vcs_type", "vcs_account_name", "create_time"]
+        self.print_response(integrations, json=self.args.json, table_layout=layout)
+
+    def _log_next_cursor(self, response: Mapping[str, Any]) -> None:
+        if response.get("next") and not self.args.json:
+            self.log.info("More results available: --cursor %s", response["next"])
+
+    @arg.organization_id
+    @arg("--vcs-integration-id", required=True, help="VCS integration ID (see 'service application vcs-integration list')")
+    @arg("--search", help="Search repositories by name")
+    @arg("--cursor", help="Pagination cursor from a previous page; excludes --search")
+    @arg.json
+    def service__application__repository__list(self) -> None:
+        """List repositories of a VCS integration available to Aiven Runtime"""
+        response = self.client.list_application_vcs_repositories(
+            organization_id=self.args.organization_id,
+            vcs_integration_id=self.args.vcs_integration_id,
+            search=self.args.search,
+            cursor=self.args.cursor,
+        )
+        if self.args.json:
+            self.print_response(response, json=True)
+            return
+        layout = ["remote_repository_id", "full_name", "source_url", "default_branch_name"]
+        self.print_response(response["repositories"], json=False, table_layout=layout)
+        self._log_next_cursor(response)
+
+    @arg.organization_id
+    @arg("--vcs-integration-id", required=True, help="VCS integration ID")
+    @arg(
+        "--remote-repository-id",
+        required=True,
+        help="Repository ID (see 'service application repository list')",
+    )
+    @arg("--cursor", help="Pagination cursor from a previous page")
+    @arg.json
+    def service__application__branch__list(self) -> None:
+        """List branches and their head commits of a repository available to Aiven Runtime"""
+        response = self.client.list_application_vcs_branches(
+            organization_id=self.args.organization_id,
+            vcs_integration_id=self.args.vcs_integration_id,
+            remote_repository_id=self.args.remote_repository_id,
+            cursor=self.args.cursor,
+        )
+        if self.args.json:
+            self.print_response(response, json=True)
+            return
+        self.print_response(response["branches"], json=False, table_layout=["name", "commit_sha"])
+        self._log_next_cursor(response)
+
+    @arg.organization_id
+    @arg("--vcs-integration-id", required=True, help="VCS integration ID")
+    @arg("--remote-repository-id", required=True, help="Repository ID")
+    @arg("--commit-sha", required=True, help="Commit SHA to inspect (see 'service application branch list')")
+    @arg.json
+    def service__application__manifest__list(self) -> None:
+        """List Containerfiles, Dockerfiles and Compose files in a repository at a commit"""
+        files = self.client.list_application_container_manifest_files(
+            organization_id=self.args.organization_id,
+            vcs_integration_id=self.args.vcs_integration_id,
+            remote_repository_id=self.args.remote_repository_id,
+            commit_sha=self.args.commit_sha,
+        )
+        layout = ["file_path", "container_manifest_type", "file_sha"]
+        self.print_response(files, json=self.args.json, table_layout=layout)
+
+    @arg.organization_id
+    @arg("--vcs-integration-id", required=True, help="VCS integration ID")
+    @arg("--remote-repository-id", required=True, help="Repository ID")
+    @arg("--commit-sha", required=True, help="Commit SHA to scan")
+    @arg("--branch", required=True, help="Branch the suggested services deploy from")
+    @arg("--repository-url", required=True, help="Repository URL, e.g. the source_url from 'repository list'")
+    @arg("--file-path", required=True, help="Manifest path (see 'service application manifest list')")
+    @arg.json
+    def service__application__scan(self) -> None:
+        """Scan a container manifest and suggest Aiven Runtime application and service configurations"""
+        file_scan = self.client.scan_application_container_manifest(
+            organization_id=self.args.organization_id,
+            vcs_integration_id=self.args.vcs_integration_id,
+            remote_repository_id=self.args.remote_repository_id,
+            commit_sha=self.args.commit_sha,
+            branch=self.args.branch,
+            file_path=self.args.file_path,
+            repository_url=self.args.repository_url,
+        )
+        if self.args.json:
+            self.print_response(file_scan, json=True)
+            return
+        self.print_response(
+            file_scan.get("service_suggestions", []), json=False, table_layout=["service_name", "service_type"]
+        )
+
     @arg.project
     @arg.force
     @arg("service_name", help="Service name", nargs="+")

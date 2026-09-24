@@ -23,6 +23,7 @@ from tests.test_client import MockResponse
 from typing import Any
 
 import json
+import logging
 import pytest
 import requests
 
@@ -30,6 +31,7 @@ BASE_URL = "https://api.example.invalid"
 PROJECT = "test-project"
 APP = "example-app"
 SERVICE_PATH = f"/project/{PROJECT}/service/{APP}"
+VCS_PATH = "/organization/org123/application/vcs-integrations"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
 APPLICATION_USER_CONFIG_SCHEMA = {
@@ -563,3 +565,147 @@ def test_application_redeploy_wait_times_out_without_new_deployment(tmp_path: Pa
         == EXIT_CODE_TIMEOUT
     )
     assert "no new deployment" in caplog.text
+
+
+def test_application_vcs_integration_list(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    integration = {
+        "vcs_integration_id": "vcs123",
+        "vcs_type": "github",
+        "vcs_account_name": "example",
+        "create_time": "2026-09-01T00:00:00Z",
+        "remote_configure_url": None,
+    }
+    harness = make_harness(tmp_path, {("GET", VCS_PATH): [ok({"vcs_integrations": [integration]})]})
+
+    assert harness.run("service", "application", "vcs-integration", "list", "--organization-id", "org123", "--json") is None
+    assert json.loads(capsys.readouterr().out) == [integration]
+
+
+MANIFEST_ARGS = ["--vcs-integration-id", "vcs123", "--remote-repository-id", "r1", "--commit-sha", SHA]
+VCS_INTEGRATION = {
+    "vcs_integration_id": "vcs123",
+    "vcs_type": "github",
+    "vcs_account_name": "example",
+    "create_time": "2026-09-01T00:00:00Z",
+    "remote_configure_url": None,
+}
+REPOSITORY = {
+    "remote_repository_id": "r1",
+    "vcs_integration_id": "vcs123",
+    "vcs_type": "github",
+    "full_name": "example/app",
+    "name": "app",
+    "source_url": "https://github.com/example/app.git",
+    "default_branch_name": "main",
+}
+MANIFEST_FILE = {"file_path": "Dockerfile", "file_sha": "f1", "container_manifest_type": "containerfile"}
+
+
+@pytest.mark.parametrize(
+    ("command", "route", "response", "header"),
+    [
+        (
+            ["vcs-integration", "list"],
+            ("GET", VCS_PATH),
+            {"vcs_integrations": [VCS_INTEGRATION]},
+            ["VCS_INTEGRATION_ID", "VCS_TYPE", "VCS_ACCOUNT_NAME", "CREATE_TIME"],
+        ),
+        (
+            ["repository", "list", "--vcs-integration-id", "vcs123"],
+            ("GET", VCS_PATH + "/vcs123/repositories"),
+            {"repositories": [REPOSITORY], "next": None, "previous": None},
+            ["REMOTE_REPOSITORY_ID", "FULL_NAME", "SOURCE_URL", "DEFAULT_BRANCH_NAME"],
+        ),
+        (
+            ["manifest", "list", *MANIFEST_ARGS],
+            ("GET", VCS_PATH + f"/vcs123/repositories/r1/refs/{SHA}/container-manifest-files"),
+            {"container_manifest_files": [MANIFEST_FILE]},
+            ["FILE_PATH", "CONTAINER_MANIFEST_TYPE", "FILE_SHA"],
+        ),
+        (
+            ["scan", *MANIFEST_ARGS, "--branch", "main", "--repository-url", "u", "--file-path", "Dockerfile"],
+            ("POST", VCS_PATH + f"/vcs123/repositories/r1/refs/{SHA}/scan-container-manifest"),
+            {"file_scan": {"service_suggestions": [{"service_name": "app", "service_type": "application"}]}},
+            ["SERVICE_NAME", "SERVICE_TYPE"],
+        ),
+    ],
+)
+def test_application_list_tables(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    command: list[str],
+    route: tuple[str, str],
+    response: dict[str, Any],
+    header: list[str],
+) -> None:
+    harness = make_harness(tmp_path, {route: [ok(response)]})
+
+    assert harness.run("service", "application", *command, "--organization-id", "org123") is None
+    header_line, _separator, *rows = capsys.readouterr().out.splitlines()
+    assert header_line.split() == header
+    assert len(rows) == 1
+
+
+def test_application_repository_list_passes_query(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    page = {"repositories": [{"remote_repository_id": "r1", "full_name": "example/app"}], "next": "c2", "previous": None}
+    harness = make_harness(tmp_path, {("GET", VCS_PATH + "/vcs123/repositories"): [ok(page)]})
+
+    args = ["--organization-id", "org123", "--vcs-integration-id", "vcs123", "--search", "app", "--json"]
+    assert harness.run("service", "application", "repository", "list", *args) is None
+
+    assert harness.session.requests[0].params == {"search": "app"}
+    assert json.loads(capsys.readouterr().out) == page
+
+
+def test_application_branch_list_table_logs_cursor(
+    tmp_path: Path, capsys: CaptureFixture[str], caplog: LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    page = {"branches": [{"name": "main", "commit_sha": SHA}], "next": "c2", "previous": None}
+    harness = make_harness(tmp_path, {("GET", VCS_PATH + "/vcs123/repositories/r1/branches"): [ok(page)]})
+
+    args = [
+        "--organization-id",
+        "org123",
+        "--vcs-integration-id",
+        "vcs123",
+        "--remote-repository-id",
+        "r1",
+        "--cursor",
+        "c1",
+    ]
+    assert harness.run("service", "application", "branch", "list", *args) is None
+
+    assert harness.session.requests[0].params == {"cursor": "c1"}
+    assert SHA in capsys.readouterr().out
+    assert "--cursor c2" in caplog.text
+
+
+def test_application_manifest_list(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    files = [{"file_path": "Dockerfile", "file_sha": "f1", "container_manifest_type": "containerfile"}]
+    path = VCS_PATH + f"/vcs123/repositories/r1/refs/{SHA}/container-manifest-files"
+    harness = make_harness(tmp_path, {("GET", path): [ok({"container_manifest_files": files})]})
+
+    args = ["--organization-id", "org123", "--vcs-integration-id", "vcs123", "--remote-repository-id", "r1"]
+    assert harness.run("service", "application", "manifest", "list", *args, "--commit-sha", SHA, "--json") is None
+    assert json.loads(capsys.readouterr().out) == files
+
+
+def test_application_scan_sends_file_and_prints_suggestions(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    file_scan = {"container_manifest_type": "containerfile", "service_suggestions": [{"service_name": "app"}]}
+    path = VCS_PATH + f"/vcs123/repositories/r1/refs/{SHA}/scan-container-manifest"
+    harness = make_harness(tmp_path, {("POST", path): [ok({"file_scan": file_scan})]})
+
+    args = [
+        *("--organization-id", "org123", "--vcs-integration-id", "vcs123", "--remote-repository-id", "r1"),
+        *("--commit-sha", SHA, "--branch", "main", "--repository-url", "https://github.com/example/app.git"),
+        *("--file-path", "Dockerfile", "--json"),
+    ]
+    assert harness.run("service", "application", "scan", *args) is None
+
+    assert harness.session.requests[0].body == {
+        "branch": "main",
+        "file_path": "Dockerfile",
+        "repository_url": "https://github.com/example/app.git",
+    }
+    assert json.loads(capsys.readouterr().out) == file_scan

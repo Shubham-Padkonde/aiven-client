@@ -387,6 +387,13 @@ An Aiven Runtime application is a service of type ``application``. Create, updat
 and terminate it with the ``avn service`` commands; the ``avn service application``
 commands cover the rest.
 
+Find the connected GitHub account, repository, branch and manifest to deploy::
+
+    $ avn service application vcs-integration list --organization-id <organization id>
+    $ avn service application repository list --organization-id <organization id> --vcs-integration-id <vcs integration id> --search <name>
+    $ avn service application branch list --organization-id <organization id> --vcs-integration-id <vcs integration id> --remote-repository-id <repository id>
+    $ avn service application manifest list --organization-id <organization id> --vcs-integration-id <vcs integration id> --remote-repository-id <repository id> --commit-sha <sha>
+
 Create an application from a JSON user configuration, then wait for its deployment::
 
     $ avn service create myapp -t application --plan startup-50-1024 --cloud aws-eu-west-1 --user-config-json @app.json
@@ -411,6 +418,11 @@ example::
 
 For a private repository, also set ``vcs_integration_id`` and ``remote_repository_id``
 in ``source``.
+
+To get a suggested user configuration for a manifest in the repository, scan it and use a
+``service_suggestions[].user_config`` from the output::
+
+    $ avn service application scan --organization-id <organization id> --vcs-integration-id <vcs integration id> --remote-repository-id <repository id> --commit-sha <sha> --branch <branch> --repository-url <repository url> --file-path <manifest path> --json
 
 Show the build and deployment status::
 
