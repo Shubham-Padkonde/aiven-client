@@ -148,6 +148,57 @@ def connection_lifetime_arg(value: str) -> float | None:
     return None if parsed == -1 else parsed
 
 
+APPLICATION_WAIT_DEFAULT_TIMEOUT: Final = 1800
+APPLICATION_WAIT_FIRST_INTERVAL: Final = 5.0
+APPLICATION_WAIT_BACKOFF: Final = 1.5
+APPLICATION_WAIT_MAX_INTERVAL: Final = 30.0
+APPLICATION_WAIT_MAX_CONSECUTIVE_ERRORS: Final = 5
+EXIT_CODE_TIMEOUT: Final = 3
+
+APPLICATION_STATUS_LAYOUT: Final = [
+    "service_name",
+    "state",
+    "build_status",
+    "deployment_status",
+    "deployed_commit_sha",
+    "repository_url",
+    "branch",
+    "outcome",
+]
+
+
+def application_status(service: Mapping[str, Any]) -> dict[str, Any]:
+    """Summarize the deployment status of an Aiven Runtime application from its service response.
+
+    The API reports a failed redeploy as `state` RUNNING while an older revision still runs,
+    and a failed first build as POWEROFF, so `state` alone cannot tell success from failure;
+    the build and deployment status in `metadata` can.
+    """
+    metadata = service.get("metadata") or {}
+    source = ((service.get("user_config") or {}).get("application") or {}).get("source") or {}
+    state = service.get("state")
+    build_status = metadata.get("application_build_status")
+    deployment_status = metadata.get("application_deployment_status")
+    if build_status == "FAILURE" or deployment_status in {"FAILED", "ABORTED"}:
+        outcome = "failed"
+    elif deployment_status == "COMPLETED" and state == "RUNNING":
+        outcome = "succeeded"
+    elif state == "POWEROFF":
+        outcome = "powered_off"
+    else:
+        outcome = "in_progress"
+    return {
+        "service_name": service.get("service_name"),
+        "state": state,
+        "build_status": build_status,
+        "deployment_status": deployment_status,
+        "deployed_commit_sha": metadata.get("application_deployment_commit_sha"),
+        "repository_url": source.get("repository_url"),
+        "branch": source.get("branch"),
+        "outcome": outcome,
+    }
+
+
 class ClientFactory(Protocol):
     def __call__(
         self,
@@ -163,9 +214,16 @@ class ClientFactory(Protocol):
 class AivenCLI(argx.CommandLineTool):
     client: AivenClient
 
-    def __init__(self, client_factory: ClientFactory = AivenClient):
+    def __init__(
+        self,
+        client_factory: ClientFactory = AivenClient,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
         argx.CommandLineTool.__init__(self, "avn")
         self.client_factory = client_factory
+        self._sleep = sleep
+        self._monotonic = monotonic
 
     def add_args(self, parser: ArgumentParser) -> None:
         parser.add_argument(
@@ -3502,6 +3560,98 @@ ssl.truststore.type=JKS
                 self.log.info("Waiting for services to start")
 
             time.sleep(3.0)
+
+    def _get_application_status(self, project: str, service_name: str) -> dict[str, Any]:
+        service = self.client.get_service(project=project, service=service_name)
+        if service.get("service_type") != "application":
+            raise argx.UserError(
+                "Service {!r} is not an Aiven Runtime application (service type {!r})".format(
+                    service_name, service.get("service_type")
+                )
+            )
+        return application_status(service)
+
+    def _poll_application_status(self, project: str, service_name: str) -> dict[str, Any] | None:
+        """Fetch the application status once; None when the request failed in a way worth retrying"""
+        try:
+            return self._get_application_status(project, service_name)
+        except client.Error as ex:
+            if ex.status != HTTPStatus.TOO_MANY_REQUESTS and ex.status < HTTPStatus.INTERNAL_SERVER_ERROR:
+                raise
+            self.log.warning("Fetching application status failed: %s", ex)
+        except requests.exceptions.ConnectionError as ex:
+            self.log.warning("Fetching application status failed: %s", ex)
+        return None
+
+    def _wait_for_application(self, *, project: str, service_name: str, timeout: float) -> tuple[int, dict[str, Any] | None]:
+        """Poll the service until its deployment outcome is final, backing off to limit API load"""
+        deadline = self._monotonic() + timeout
+        interval = APPLICATION_WAIT_FIRST_INTERVAL
+        consecutive_errors = 0
+        summary: dict[str, Any] | None = None
+        reported: dict[str, Any] | None = None
+        while True:
+            current = self._poll_application_status(project, service_name)
+            if current is None:
+                consecutive_errors += 1
+                if consecutive_errors >= APPLICATION_WAIT_MAX_CONSECUTIVE_ERRORS:
+                    raise argx.UserError("Fetching application status failed repeatedly, aborting.")
+            else:
+                consecutive_errors = 0
+                summary = current
+                if summary != reported:
+                    self.log.info(
+                        "Application %r: state %s, build %s, deployment %s, outcome %s",
+                        service_name,
+                        summary["state"],
+                        summary["build_status"],
+                        summary["deployment_status"],
+                        summary["outcome"],
+                    )
+                    reported = summary
+                if summary["outcome"] != "in_progress":
+                    return (0 if summary["outcome"] == "succeeded" else 1), summary
+
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                self.log.error("Timeout waiting for application %r deployment", service_name)
+                return EXIT_CODE_TIMEOUT, summary
+            self._sleep(min(interval, remaining))
+            interval = min(interval * APPLICATION_WAIT_BACKOFF, APPLICATION_WAIT_MAX_INTERVAL)
+
+    def _print_application_status(self, summary: Mapping[str, Any] | None) -> None:
+        if summary is not None:
+            self.print_response(summary, json=self.args.json, table_layout=APPLICATION_STATUS_LAYOUT, single_item=True)
+
+    @arg.project
+    @arg.service_name
+    @arg.json
+    def service__application__status(self) -> None:
+        """Show the build and deployment status of an Aiven Runtime application"""
+        self._print_application_status(self._get_application_status(self.get_project(), self.args.service_name))
+
+    @arg.project
+    @arg.service_name
+    @arg(
+        "--timeout",
+        type=int,
+        default=APPLICATION_WAIT_DEFAULT_TIMEOUT,
+        help="Wait for up to N seconds (default: %(default)s)",
+    )
+    @arg.json
+    def service__application__wait(self) -> int:
+        """Wait for an Aiven Runtime application deployment: exit 0 succeeded, 1 failed or powered off, 3 timeout.
+
+        After 'service update', use 'service application redeploy --wait' instead: until the update is
+        processed, wait may report the previous deployment.
+        """
+        exit_code, summary = self._wait_for_application(
+            project=self.get_project(),
+            service_name=self.args.service_name,
+            timeout=self.args.timeout,
+        )
+        self._print_application_status(summary)
+        return exit_code
 
     @arg.project
     @arg.force

@@ -384,11 +384,16 @@ Aiven Runtime Applications
 --------------------------
 
 An Aiven Runtime application is a service of type ``application``. Create, update, power
-and terminate it with the ``avn service`` commands.
+and terminate it with the ``avn service`` commands; the ``avn service application``
+commands cover the rest.
 
-Create an application from a JSON user configuration::
+Create an application from a JSON user configuration, then wait for its deployment::
 
     $ avn service create myapp -t application --plan startup-50-1024 --cloud aws-eu-west-1 --user-config-json @app.json
+    $ avn service application wait myapp
+
+After service update, use avn service application redeploy --wait rather than
+wait: until the update is processed, wait may report the previous deployment.
 
 ``app.json`` holds the service ``user_config``, the same object as in the API. A minimal
 example::
@@ -406,6 +411,10 @@ example::
 
 For a private repository, also set ``vcs_integration_id`` and ``remote_repository_id``
 in ``source``.
+
+Show the build and deployment status::
+
+    $ avn service application status myapp
 
 View build logs::
 
