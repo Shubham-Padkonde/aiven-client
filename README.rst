@@ -407,6 +407,10 @@ example::
 For a private repository, also set ``vcs_integration_id`` and ``remote_repository_id``
 in ``source``.
 
+View build logs::
+
+    $ avn service logs myapp --log-type application-build
+
 Custom Files
 ------------
 

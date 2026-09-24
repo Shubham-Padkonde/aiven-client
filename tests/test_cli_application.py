@@ -257,3 +257,15 @@ def test_service_update_user_config_json(tmp_path: Path) -> None:
 
     assert harness.session.paths("GET") == [SERVICE_PATH]
     assert harness.session.requests[-1].body["user_config"] == user_config
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_log_type"),
+    [(["--log-type", "application-build"], "application-build"), ([], None)],
+)
+def test_service_logs_log_type(tmp_path: Path, extra_args: list[str], expected_log_type: str | None) -> None:
+    logs: dict[str, Any] = {"logs": [], "offset": None, "first_log_offset": None}
+    harness = make_harness(tmp_path, {("POST", SERVICE_PATH + "/logs"): [ok(logs)]})
+
+    assert harness.run("service", "logs", "--project", PROJECT, *extra_args, APP) is None
+    assert harness.session.requests[0].body.get("log_type") == expected_log_type
